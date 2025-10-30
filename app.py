@@ -127,7 +127,7 @@ def get_embedding_model():
 @st.cache_resource
 def get_vector_db():
     print("Vektör veritabanı başlatılıyor...")
-    client = chromadb.PersistentClient(path="./chroma_db") 
+    client = chromadb.EphemeralClient() 
     print("Vektör veritabanı başlatıldı.")
     return client
 
