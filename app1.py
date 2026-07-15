@@ -7,12 +7,15 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 
 # ------------------------------------------------------------------
-#  PDF PARSING (Ayrıştırma) FONKSİYONU (Açıklamasız Versiyon)
+#  PDF PARSING (Ayrıştırma) FONKSİYONU (GÜNCELLENDİ)
 # ------------------------------------------------------------------
 def parse_aws_questions(pdf_content):
     """
     Bir PDF dosya içeriğini okur, metni birleştirir ve
-    Regex kullanarak ayrıştırıp açıklama içermeyen bir soru listesi döndürür.
+    Regex kullanarak ayrıştırıp bir soru listesi döndürür.
+    
+    BU VERSİYON: Soru numaralarındaki ' [Sayı] )' formatını
+    destekler.
     """
     text = ""
     try:
@@ -28,19 +31,25 @@ def parse_aws_questions(pdf_content):
 
     questions = []
     
-    # PDF yapısını doğru yakalamak için regex kalıbı korunmuştur
+    # --- GÜNCELLENMİŞ ANA REGEX KALIBI ---
+    # Soru numarasından sonra boşluk (\s*) olmasını destekler.
     pattern = re.compile(
+        # --- DEĞİŞİKLİK BURADA ---
         r"^(\d+)\s*\)\s(.*?)" +         # Grup 1 (num), opsiyonel boşluk, ), boşluk, Grup 2 (Q Text)
+        # --- DEĞİŞİKLİK SONU ---
         r"(?=\n[A-Z]\.)" +              # Anchor: Şıkların başladığı yer (\nA.)
         r"((?:(?!\nCorrect Answer:|\nExplanation:).)*)" + # Grup 3: Şıklar
         r"(\nExplanation:((?:(?!\nCorrect Answer:).)*))?" + # Grup 4/5: Açıklama (Önce)
         r"(\nCorrect Answer:\s*([A-Z]{1,5}))" +  # Grup 6/7: Cevap (Zorunlu, AD/BC gibi çoklu cevap desteği)
         r"((?:(?!\n\d+\)|$).)*)?" +     # Grup 8: Açıklama (Sonra)
-        r"(?=\n\d+\s*\)|$)",            # End Anchor
+        r"(?=\n\d+\s*\)|$)",            # End Anchor (Buraya da \s* eklendi)
         re.DOTALL | re.IGNORECASE
     )
     
+    # --- GÜNCELLENMİŞ Soru Ayırıcı (re.split) ---
+    # Soru numarasından önce boşluk (\s*) olmasını destekler.
     chunks = re.split(r'\n(?=\d+\s*\))', text)
+    # --- DEĞİŞİKLİK SONU ---
 
     for i, chunk in enumerate(chunks):
         if not chunk.strip():
@@ -50,11 +59,11 @@ def parse_aws_questions(pdf_content):
         
         if match:
             (q_num, q_text, options_block,
-             _full_expl_before, _expl_text_before,
+             _full_expl_before, expl_text_before,
              _full_answer_line, correct_letter,
-             _expl_text_after) = match.groups()
+             expl_text_after) = match.groups()
             
-            # Soru numarasını ve metnini birleştir
+            # Soru numarasını (Grup 1) ve metnini (Grup 2) birleştir
             question = f"{q_num}) {q_text.strip()}"
             
             cleaned_options = []
@@ -69,21 +78,31 @@ def parse_aws_questions(pdf_content):
             correct_answer_full_text = ""
             correct_letter = correct_letter.strip()
             
-            # Doğru cevabın tam metnini bul
+            # Doğru cevabın tam metnini bul (örn: "A. ...")
+            # Çoklu cevap (AD, BC) varsa, sadece ilk harfi (A) temel al
             first_correct_letter = correct_letter[0]
             for opt in cleaned_options:
                 if opt.strip().startswith(first_correct_letter + "."):
                     correct_answer_full_text = opt
                     break
             
+            # Tam metin bulunamazsa, sadece harfi/harfleri (örn: AD) kullan
             if not correct_answer_full_text:
                 correct_answer_full_text = correct_letter
 
-            # Açıklama (aciklama) anahtarı veri yapısından tamamen kaldırılmıştır.
+            explanation_text = ""
+            if expl_text_before:
+                explanation_text = expl_text_before.strip()
+            elif expl_text_after:
+                explanation_text = expl_text_after.strip()
+                if explanation_text.lower().startswith("explanation:"):
+                     explanation_text = explanation_text[len("explanation:"):].strip()
+
             q_data = {
                 'soru': question,
                 'siklar': cleaned_options,
-                'dogru_cevap': correct_answer_full_text
+                'dogru_cevap': correct_answer_full_text,
+                'aciklama': explanation_text
             }
             questions.append(q_data)
         
@@ -96,7 +115,7 @@ def parse_aws_questions(pdf_content):
     return questions
 
 # ------------------------------------------------------------------
-#  Veritabanı ve Model Fonksiyonları
+#  Veritabanı ve Model Fonksiyonları (Değişiklik Yok)
 # ------------------------------------------------------------------
 @st.cache_resource
 def get_embedding_model():
@@ -130,8 +149,7 @@ def setup_database(client, model, questions_list):
         ids_for_db = []
         
         for i, q in enumerate(questions_list):
-            # İndeksleme sadece Soru metni üzerinden yapılır (Açıklama kaldırıldı)
-            content = f"Question: {q['soru']}"
+            content = f"Question: {q['soru']} \nExplanation: {q['aciklama']}"
             documents_to_embed.append(content)
             metadatas_for_db.append({"original_index": i})
             ids_for_db.append(f"q_{i}")
@@ -164,7 +182,7 @@ def load_and_parse_questions(pdf_path):
         return None
 
 # ------------------------------------------------------------------
-#  Streamlit Arayüzü
+#  Streamlit Arayüzü (Değişiklik Yok)
 # ------------------------------------------------------------------
 
 st.title("AWS Semantic Quiz Bot 🧠☁️")
@@ -271,7 +289,7 @@ elif st.session_state.quiz_started and st.session_state.current_question_index <
             user_answer_prefix = user_answer.strip()[0]
             
             # Cevap 'A' veya 'AD' gibi sadece harfse
-            if len(correct_answer_text) <= 5: 
+            if len(correct_answer_text) <= 5: # 5 harfe kadar (örn: ACDE)
                  correct_answer_prefix = correct_answer_text
             # Cevap 'A. ...' gibi tam metinse
             else:
@@ -284,7 +302,8 @@ elif st.session_state.quiz_started and st.session_state.current_question_index <
             else:
                 st.error(f"Incorrect. The correct answer was: {q.get('dogru_cevap', 'N/A')}")
             
-            # NOT: st.info(Explanation) bloğu buradan tamamen kaldırılmıştır.
+            if q.get('aciklama'):
+                st.info(f"Explanation: {q.get('aciklama')}")
             
             st.session_state.current_question_index += 1
             
