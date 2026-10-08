@@ -49,11 +49,11 @@ def parse_aws_questions(pdf_content):
         cleaned_lines.append(line)
 
     # STAGE 1: Collect all questions (with or without answers)
-    raw_questions = []  # Each: {'num': ..., 'text': ..., 'options': [...], 'correct': ...}
+    raw_questions = []
     current_question = None
     current_options = []
     current_correct = None
-    answer_seen_for_current = False  # Flag: answer line seen for current question
+    answer_seen_for_current = False
 
     question_start_pattern = re.compile(r'^\s*(\d+)\s*[\)\.\-]\s*(.*)')
     option_pattern = re.compile(r'^([A-Z])\s*[\)\.\-]?\s+(.+)')
@@ -147,7 +147,6 @@ def parse_aws_questions(pdf_content):
                         break
                     if next_line.startswith(('Explanation:', 'Correct Answer', 'Answer', 'Ans')):
                         break
-                    # Stop if the next line looks like an explanation paragraph
                     if re.match(r'^[A-Z][a-z]', next_line) and len(next_line) > 80:
                         break
                     if re.match(r'^(The|This|These|Those|It|In|For|A |An )', next_line) and len(next_line) > 60:
@@ -167,31 +166,62 @@ def parse_aws_questions(pdf_content):
 
         i += 1
 
-    # Save last question
     save_current()
 
     # STAGE 2: Build final questions WITHOUT merging by number.
-    # The PDF contains duplicate question numbers with different content,
-    # so merging them caused options to be mixed between different questions.
     final_questions = []
     for rq in raw_questions:
         if len(rq['options']) < 2:
-            continue  # Skip questions without options
+            continue
 
-        # Build full correct answer text
-        correct_full = ""
+        # --- Doğru cevap harflerini çıkar (örneğin "AD", "BC", "A") ---
+        correct_letters = ""
         if rq['correct']:
-            correct_clean = rq['correct'].replace(" ", "").replace(",", "").upper()
-            if correct_clean:
-                first_letter = correct_clean[0]
+            correct_letters = rq['correct'].replace(" ", "").replace(",", "").upper()
+
+        # --- Soru metninden çoklu cevap olup olmadığını tespit et ---
+        soru_metni_lower = rq['text'].lower()
+        coklu_cevap = False
+
+        # Doğru cevap harf sayısı > 1 ise çoklu cevap
+        if len(correct_letters) > 1:
+            coklu_cevap = True
+
+        # Soru metninde çoklu cevap ifadesi var mı?
+        if re.search(
+            r'(choose|select)\s+(two|three|2|3|four|4)',
+            soru_metni_lower
+        ):
+            coklu_cevap = True
+        if '(choose two' in soru_metni_lower or '(select two' in soru_metni_lower:
+            coklu_cevap = True
+        if 'choose two.' in soru_metni_lower or 'select two.' in soru_metni_lower:
+            coklu_cevap = True
+        if 'choose three' in soru_metni_lower or 'select three' in soru_metni_lower:
+            coklu_cevap = True
+
+        # --- Doğru cevabın tam metnini oluştur ---
+        correct_full = ""
+        if correct_letters:
+            if coklu_cevap and len(correct_letters) > 1:
+                # Çoklu cevap: tüm doğru seçeneklerin tam metinlerini birleştir
+                full_texts = []
+                for letter in correct_letters:
+                    for opt in rq['options']:
+                        if opt.strip().startswith(letter + "."):
+                            full_texts.append(opt)
+                            break
+                correct_full = " | ".join(full_texts) if full_texts else correct_letters
+            else:
+                # Tek cevap: tam metni bul
+                first_letter = correct_letters[0]
                 for opt in rq['options']:
                     if opt.strip().startswith(first_letter + "."):
                         correct_full = opt
                         break
                 if not correct_full:
-                    correct_full = correct_clean
+                    correct_full = correct_letters
 
-        # Build question text with number
         if rq['num']:
             soru_text = f"{rq['num']}) {rq['text']}"
         else:
@@ -200,10 +230,12 @@ def parse_aws_questions(pdf_content):
         final_questions.append({
             'soru': soru_text,
             'siklar': rq['options'],
-            'dogru_cevap': correct_full
+            'dogru_cevap': correct_full,
+            'dogru_harfler': correct_letters,   # "AD", "BC", "A"
+            'coklu_cevap': coklu_cevap           # True / False
         })
 
-    # Sort by question number (stable order for duplicates)
+    # Sort by question number
     def sort_key(q):
         m = re.match(r'^(\d+)\)', q['soru'])
         return int(m.group(1)) if m else 999999
@@ -253,7 +285,6 @@ def setup_database(client, model, questions_list):
             metadatas_for_db.append({"original_index": i})
             ids_for_db.append(f"q_{i}")
 
-        # Add in batches (for ChromaDB limits)
         batch_size = 500
         for start in range(0, len(documents_to_embed), batch_size):
             end = start + batch_size
@@ -372,38 +403,92 @@ elif st.session_state.quiz_started and st.session_state.current_question_index <
     st.subheader(f"Question {idx + 1} / {st.session_state.num_to_ask}")
     st.write(q.get('soru', 'Question text not found'))
 
-    with st.form(key=f"form_q_{idx}"):
-        user_answer = st.radio(
-            "Select your answer:",
-            q.get('siklar', []),
-            key=f"radio_q_{idx}",
-            index=None
+    is_multi = q.get('coklu_cevap', False)
+    dogru_harfler = q.get('dogru_harfler', '')
+
+    # Çoklu cevap sorusu ise bilgilendirme
+    if is_multi:
+        beklenen_sayi = len(dogru_harfler) if dogru_harfler else 2
+        st.info(
+            f"ℹ️ This question has **multiple correct answers**. "
+            f"Select **{beklenen_sayi}** option(s) and then submit."
         )
+
+    with st.form(key=f"form_q_{idx}"):
+
+        if is_multi:
+            # --- ÇOKLU CEVAP: checkbox kullan ---
+            st.write("**Select your answers:**")
+            selected_options = []
+            for opt_index, opt in enumerate(q.get('siklar', [])):
+                # Her checkbox için benzersiz key
+                if st.checkbox(opt, key=f"chk_q_{idx}_{opt_index}"):
+                    selected_options.append(opt)
+            user_answer = selected_options  # liste
+        else:
+            # --- TEK CEVAP: radio kullan ---
+            user_answer = st.radio(
+                "Select your answer:",
+                q.get('siklar', []),
+                key=f"radio_q_{idx}",
+                index=None
+            )
+
         submit_button = st.form_submit_button("Submit Answer")
 
     if submit_button:
-        if user_answer is None:
-            st.warning("Please select an answer.")
+        # --- Boş cevap kontrolü ---
+        if is_multi:
+            if not user_answer:
+                st.warning("Please select at least one answer.")
+                st.stop()
         else:
-            st.session_state.user_answers[idx] = user_answer
+            if user_answer is None:
+                st.warning("Please select an answer.")
+                st.stop()
 
-            # --- ROBUST ANSWER DISPLAY ---
-            correct_answer_text = q.get('dogru_cevap', '').strip()
+        st.session_state.user_answers[idx] = user_answer
 
-            # Get the letter of the user's chosen option
+        correct_answer_text = q.get('dogru_cevap', '').strip()
+        correct_letters = dogru_harfler.replace(" ", "").replace(",", "").upper()
+
+        if is_multi:
+            # --- ÇOKLU CEVAP KARŞILAŞTIRMASI ---
+            # Kullanıcının seçtiği harfleri topla
+            user_letters = set()
+            for ans in user_answer:
+                if ans.strip():
+                    user_letters.add(ans.strip()[0].upper())
+
+            # Doğru cevap harfleri kümesi
+            correct_set = set(correct_letters) if correct_letters else set()
+
+            # Tam eşleşme kontrolü (eksik veya fazla seçim yanlış)
+            if user_letters and user_letters == correct_set:
+                st.success("Correct! 🎉")
+                st.session_state.score += 1
+            else:
+                st.error("❌ Incorrect.")
+                st.write(f"**Your selection:** {', '.join(sorted(user_letters)) if user_letters else '(none)'}")
+                if correct_letters:
+                    st.write(f"**Correct answer(s):** {correct_letters}")
+                if correct_answer_text:
+                    st.write(f"**Full correct answer text:**")
+                    st.write(correct_answer_text)
+
+        else:
+            # --- TEK CEVAP KARŞILAŞTIRMASI ---
             user_answer_prefix = user_answer.strip()[0] if user_answer.strip() else ""
 
-            # Determine the correct answer letter(s)
             correct_letter = ""
-            if correct_answer_text:
-                # Full text like "A. Copy the data..."?
+            if correct_letters:
+                correct_letter = correct_letters
+            elif correct_answer_text:
                 if len(correct_answer_text) > 5 and correct_answer_text[1:2] == '.':
                     correct_letter = correct_answer_text[0]
                 else:
-                    # Just letter(s) like "AD" or "A"
                     correct_letter = correct_answer_text.replace(" ", "").replace(",", "").upper()
 
-            # Comparison
             if correct_letter and user_answer_prefix in correct_letter:
                 st.success("Correct! 🎉")
                 st.session_state.score += 1
@@ -413,14 +498,18 @@ elif st.session_state.quiz_started and st.session_state.current_question_index <
                 else:
                     st.error("❌ Incorrect. (The correct answer could not be extracted from the PDF for this question.)")
 
+        # Kullanıcının cevabını göster
+        if is_multi:
+            st.caption(f"Your answers: {', '.join(sorted([a.strip()[0] for a in user_answer]))}")
+        else:
             st.caption(f"Your answer: {user_answer}")
 
-            st.session_state.current_question_index += 1
+        st.session_state.current_question_index += 1
 
-            if st.session_state.current_question_index < st.session_state.num_to_ask:
-                st.button("Next Question")
-            else:
-                st.button("View Results")
+        if st.session_state.current_question_index < st.session_state.num_to_ask:
+            st.button("Next Question")
+        else:
+            st.button("View Results")
 
 # Stage 3: Results Screen
 elif st.session_state.quiz_started and st.session_state.current_question_index >= st.session_state.num_to_ask:
